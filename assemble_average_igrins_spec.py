@@ -14,6 +14,7 @@ Then it aligns the spectra and then takes an weighted average of all of the spec
 
 author: 
 	Kim Sokal 2017
+	re-written 2018 to be orders
 	
 input:
 	config file that points to all the data. 
@@ -49,50 +50,45 @@ def read_config(configfile):
 	
 	return cfg
 
-def align_by_f_interp(shiftvalue,flux_shifted,uncs_shifted, wls_shifted,cutoffs=None):
-	#this is where we apply the pixel shift
-
-	length=len(flux_shifted)
-	pixs=np.arange(length)
-
-	#for some collections of spectra, the shift might be large.
-	#fix for the change in velocity resolution across the whole spectrum
-	change=(1.-1./45000.)*np.array(wls_shifted)
-	change=np.array(change)-np.array(wls_shifted)#just the  diff across the spec
-	ave=np.average(cutoffs)
-	change=change-change[ave.astype(int)+1]
-	shifted_pixs=pixs+shiftvalue-change			
+def align(wls_shifted,line_observed,line_reference,f):
+	#align(flux_shifted,uncs_shifted, wls_shifted,line_observed,line_reference):
+	#this is where we apply a wavelength shift
+	#the shift value is a change in wavelength, and from the line
 	
+	#actual equation for correcting Doppler shifts
+	c=299792.458
+	rv=c*((line_observed/line_reference)-1.)
+	print 'The measured rv is ', rv
+	f.write('The measured rv is '+np.str(rv)+' (km/s) \n')
+	wls_rest=wls_shifted/(1.+(rv/c))		
+			
 	#so by doing it this way, i am assuming the real "value" of the pixels here is the
 	#shifted value
-	flux_fixed=np.interp(shifted_pixs, pixs,flux_shifted)
-	uncs_fixed=np.interp(shifted_pixs, pixs,uncs_shifted)
-
-	return [flux_fixed,uncs_fixed]
+	#flux_fixed=np.interp(wls_shifted, wls_rest,flux_shifted)
+	#uncs_fixed=np.interp(wls_shifted, wls_rest,uncs_shifted)
+	
+	#return [flux_fixed,uncs_fixed]
+	return [rv,wls_rest]
 
 def gaussian(x,amp,cen,wid):
 	#just defining the gaussian to fit the sky line
 	return amp*np.exp(-(x-cen)**2/wid)
 	
-def find_line_center(pixelsin, normed, wls, cutoffs, line='abs'):
+def find_line_center(flux, wls, cutoffs, line='abs'):
 	#this is where we fit a gaussian to a line and find the center in pixel space
-	blueend_pix,redend_pix=cutoffs
-	
+	blueend,redend=cutoffs
+
+
 	#using just the specified region of the spectra
-	blueend=scipy.where(pixelsin > blueend_pix)
-	fluxes_out=normed[blueend]
-	pixels=pixelsin[blueend]
-	wls=wls[blueend]
-	
-	redend=scipy.where(pixels < redend_pix)
-	fluxes_out=fluxes_out[redend]
-	pixels=pixels[redend]
-	wls=wls[redend]
+	region=scipy.where((blueend < wls) & (wls < redend))
+	fluxes_out=flux[region]
+	wls_out=wls[region]
 	
 	#trying to make it look like a normal gaussian.
 	#meaning positive, as some lines are in absorption
 	#shouldn't effect where the center is too much
 	fluxes_out=np.array(fluxes_out)
+
 	
 	#decide here if it is emission or absorption!
 	line='abs'
@@ -102,434 +98,473 @@ def find_line_center(pixelsin, normed, wls, cutoffs, line='abs'):
 	elif line == 'em':
 		flipped=fluxes_out
 	f=flipped-np.nanmedian(flipped)
+
 	
 	#now fit it with a gaussian to find the center!
-	n=len(f)
-	newpix=np.arange(n)
-
-	init_vals=[np.max(fluxes_out), np.mean(newpix), np.mean(newpix)/0.1]
-	best_vals, covar = curve_fit(gaussian, newpix, f, p0=init_vals)
+	init_vals=[np.max(f), np.mean(wls_out), 10.]
+	best_vals, covar = curve_fit(gaussian, wls_out, f, p0=init_vals)
 	center = best_vals[1]
+	print best_vals
+	print 'The center of the line is at ', center
 
 	#plot to ensure that you are actually measuring the line center	
 	plotnow='yes'
 	if plotnow == 'yes':
 		#approx center is
-		approx_center=np.round(center)
-		approx_center=approx_center.astype(int)
-		plt.plot([center]*n, f, color="blue")
-		plt.plot(newpix, f, color="magenta")
-		plt.text(newpix[approx_center],-0.01,"wave ~"+np.str(wls[approx_center]))
+		plt.axvline(x=center, color="blue")
+		plt.plot(wls_out, f, color="magenta")
+		plt.text(center,-0.01,"wave ~"+np.str(center))
 		plt.title('Finding center of given line')
 		plt.show()
 		plt.close()
 
-	center_value=center+np.min(pixelsin[blueend])
 	return center
 
-def stitch(wlsol, spec, snr, cutoverlap='yes'):
-	#this will combine all of the orders of your spectra
-	fluxes=[]
-	wls=[]
-	sns=[]
-	
-	tracker=0
-	all_wls_starts=[]
 
-	#it goes order by order
-	for wl, I, sn in zip(wlsol, spec,snr):
-		
-		#convert units
-		wl=wl*1.e4 #from 1.4 to 1.4e4 as expected (um to Ang)
-		#just to find correct ordering of the orders, keep the starting wavelength
-		all_wls_starts.append(wl[0])
-
-		#lets chop the bad data a bit. Greg did a cut off of 8 to -6.
-		med=np.nanmean(I)
-		bad=scipy.where(-25.*med > I)
-		bad2=scipy.where(I > 25.*med)
-		
-		I[bad]=np.nan
-		sn[bad]=np.nan
-		I[bad2]=np.nan
-		sn[bad2]=np.nan		
-				
-		#Would you like to chop off the overlap regions? You really should.
-		if cutoverlap=='yes':
-			if tracker==0:
-				#this is the first order it read in. keep for later.
-				#it will be a redder order
-				red_wl=wl
-				red_I=I
-				red_sn=sn
-				tracker=tracker+1
-			
-			else:
-				
-				bluest=np.nanmin(red_wl)				
-				reddest=np.nanmax(wl)
-				
-				overlap=scipy.where(bluest < wl)
-				red_overlap=scipy.where(red_wl < reddest)
-				
-				if len(red_I[red_overlap]) > 10:
-					# lets interpolate
-					#want to keep the blue wavelength sol rather than the red
-					blue_wv=wl[overlap]
-					red_wv=red_wl[red_overlap]
-
-					#also will want the flux and sn
-					blue_sn=sn[overlap]
-					blue_I=I[overlap]
-					
-					### Working in the overlap region
-					
-					# 1. is there any data? if it is all nan, then need to keep 
-					#the other one.
-					
-					isnotnan_blue=np.isfinite(blue_I)
-					isnotnan_red=np.isfinite(red_I[red_overlap])
-					if np.sum(isnotnan_blue) !=  0:
-						#making sure they are not all nans
-						
-						overlap_flux=blue_I
-						overlap_sn=blue_sn	
-									
-						#interpolating the flux to the same wavelength sol			
-						red_flux_fixed=np.interp(blue_wv, red_wv,red_I[red_overlap])
-						red_sn_fixed=np.interp(blue_wv, red_wv,red_sn[red_overlap])
-					
-						#so at this point we have all on the blue_wv solution. 
-										
-						# 2. now i need to figure out where the red is diff from the blue by
-						#more than a certain percentage, then we will keep part
-					
-						#need to check if the red isn't just all nan
-						if np.sum(isnotnan_red) !=  0:
-							diff=(blue_I-red_flux_fixed)/red_flux_fixed
-										
-							length=len(overlap_flux)
-							half=np.rint(length/2.)
-							half=half.astype(int)
-												
-							#only on the red HALF, make the comparison
-							huge_diff=scipy.where(np.abs(diff[half:]) > 0.1)
-							
-							huge_diff=huge_diff+half
-							huge_diff=huge_diff.astype(int)
-
-							#So here we are now setting the overlap flux to the red value IF is meets
-							#the criteria
-							overlap_flux[huge_diff]=red_flux_fixed[huge_diff]					
-							overlap_sn[huge_diff]=red_sn_fixed[huge_diff]					
-					
-							red_I[red_overlap]=np.nan 
-							red_sn[red_overlap]=np.nan 
-							red_wl[red_overlap]=np.nan
-							I[overlap]=overlap_flux
-							sn[overlap]=overlap_sn
-
-									
-				### THIS IS WHERE WE ACTUALLY SAVE. Whatever is called red_*
-   		
-				wls.append(red_wl)
-				fluxes.append(red_I)
-				sns.append(red_sn)
-								
-				#now cut the red part of the current order and make it the one that will
-				#be red next
-
-				tracker=tracker+1
-				red_wl=wl
-				red_I=I
-				red_sn=sn				
-
-   				if tracker == len(wlsol):
-   					#the last order
-					wls.append(red_wl)
-					fluxes.append(red_I)
-					sns.append(red_sn)
-					
-		else:
-			print 'Overlap regions left un-altered'
-			#combine all the data	   		
-			wls.append(wl)
-			fluxes.append(I)
-			sns.append(sn)
-	#so i original wanted to sort by wavelength but it is better instead to
-	#put the orders in order.
-	#we sort by the starting wavelength of the order
-	sorts=np.argsort(all_wls_starts)
-	wls=[wls[i] for i in sorts]
-	wls=np.array(wls)
-	wls=wls.flatten()
-	fluxes=[fluxes[i] for i in sorts]
-	fluxes=np.array(fluxes)
-	fluxes=fluxes.flatten()
-	sns=[sns[i] for i in sorts]
-	sns=np.array(sns)
-	sns=sns.flatten()
-
+def fix_num_orders(wls, fluxes,sns):
+	keep = 26#53248 # 26 orders times 2048 pixels per order
+	diff=keep-len(wls)
+	#print 'there were', len(wls)
+	if diff >0:
+		#add in nans for any missing data. it is probably for the early part!
+		startwave=np.nanmin(wls)
+		#print 'start', startwave
+		if startwave < 1000:
+			#wrong units for some reason
+			startwave=startwave*1.e4
+		if startwave > 18600:
+			#one order
+			add=np.array([0.]*2048)
+			wls=np.insert(wls,-1,add, axis=0)
+			fluxes=np.insert(fluxes,-1,add, axis=0)
+			sns=np.insert(sns,-1,add, axis=0)
+			if startwave > 18800:
+				#two orders
+				wls=np.insert(wls,-1,add, axis=0)
+				fluxes=np.insert(fluxes,-1,add, axis=0)
+				sns=np.insert(sns,-1,add, axis=0)
+				if startwave > 19000:
+					#three orders
+					wls=np.insert(wls,-1,add, axis=0)
+					normed=np.insert(normed,-1,add, axis=0)
+					sns=np.insert(sns,-1,add, axis=0)
+		if len(wls) != keep:
+			diff=keep-len(wls)
+			add=np.array([0.]*diff)
+			wls=np.insert(wls,-1,add, axis=0)
+			fluxes=np.insert(fluxes,-1,add, axis=0)
+			sns=np.insert(sns,-1,add, axis=0)
+	#print 'there are now', len(wls)		
 	return [wls,fluxes,sns]
 
-"""
-This is the body of the code.
-"""
 
-### INPUT ###
-
-configfile=sys.argv[1]
-cfg=read_config(configfile)
-obsdir=cfg["obsdir"]
-filein=obsdir+cfg["filein"]
-filename_out=cfg["filename_out"]	
-band=cfg["band"]
-aligning_region=[np.float(cfg["linestart"]),np.float(cfg["linestop"])]
-
-### BEGIN PROGRAM ###
+def band_spectra(obsdir, specfile, band, f, f2):
+	wls=[]
+	Is=[]
+	sns=[]
 	
-#this is where we will start saving our data
-saved_wavesol=[]
-saved_fluxes_normed=[]
-saved_snrs=[]
-
-#I also want to save a list of the input files that it actually uses. Yes we read them
-#in, its just a good cross check.
-save_spec_files=[]
-ids=[]
-
-### STEP A: Get all the individual spectra ready to combine
-
-num=0
-#step through all of the spectra
-specfiles=np.loadtxt(filein, skiprows=0, dtype="str")
-
-for specfile in specfiles:
-
 	#step 1: read in the data	
-	specpath=obsdir+specfile
-	save_spec_files.append(specfile) 
+	specpath=obsdir+specfile	
 	spec = pyfits.getdata(specpath)
 	wlsol = pyfits.getdata(specpath,1)
 	snr = pyfits.getdata(specpath,5)	
+	dataheader = pyfits.getheader(specpath)
+
+	print '*** File ***'
+	f.write('*** File ***'+'\n')
+	
+	f.write('Individual spectrum: '+specfile+' \n')
+	print 'Individual spectrum: ', specfile
 	#this is assuming you used refine_igrins_telluric_corr.py
 	#if you did not, then re-write this line to get the snr from the .sn.fits file
 	
-	dataheader = pyfits.getheader(specpath)
-
+ 
+	
 	#step 2: learn about the data
 	object=dataheader['OBJECT',0]
 	date=dataheader['UTDATE',0]
 	amstart=dataheader['AMSTART',0]
 	amend=dataheader['AMEND',0]
 	am=0.5*(np.float(amstart)+np.float(amend))
-	sourcedets=object+date
+	tel=dataheader.get('TELESCOP')
+	exptime=dataheader.get('EXPTIME')
 	
-	print 'Spectra # ', num
+	f.write('OBJECT: '+ object+'\n')
+	f.write('DATE: '+ date+'\n')
+	f.write('am dets:'+ np.str(amstart)+'\t'+np.str(amend)+'\n')
+	f.write('average am: '+ np.str(am)+'\n')
+	f.write('telescope: '+ tel+'\n')
+	f.write('exposure time: '+ np.str(exptime)+'\n')
+
 	print 'OBJECT: ', object
 	print 'DATE: ', date
+	print 'am dets:', np.str(amstart)+'\t'+np.str(amend)
 	print 'average am: ', am
-
+	print 'telescope: ', tel
+	print 'exposure time: ', exptime
 	
-	#step 3: lets get all the data so we can combine the orders
-	### stitch all the orders together
-	wls,fluxes,sns= stitch(wlsol, spec, snr, cutoverlap='yes')	
-
-	#step 4: lets normalize the spectra
-	#lets find an average continuum value, as this will vary for each spectrum, and normalize
 	if band == 'K':
-		cont_start=scipy.where(wls > 21300)#21750)
-	if band == 'H':
-		cont_start=scipy.where(wls > 15500)
-	cont_start=cont_start[0]
-	cont_region=cont_start[0:1000]
-	Icont=fluxes[cont_region]
-	cont=np.nanmedian(Icont)
-	
-	normed=fluxes/cont
-	#and we will call all of the fluxes normed now
+		f2.write(specfile+"\t")
+		f2.write(np.str(object)+'\t'+np.str(date)+'\t'+np.str(tel)+'\t'+np.str(exptime)+'\t'+np.str(am)+'\t')
+
+	target_id=specfile.split(".J")
+	target_id=target_id[0].split("_")
+	target_id=target_id[1]+"_"+target_id[2]
+
+	#step 3. check and fix the size of the spectra (number of orders)
 		
-	#step 5. check the size of the spectra
-	
-	#lets make sure our spectra are the same length
-	keep = 53248 # 26 orders times 2048 pixels per order
-	diff=keep-len(wls)
-	
-	pix1=np.arange(len(wls))	
-	
-	if diff >0:
-		#add in nans for any missing data. it is probably for the early part!
-		startwave=np.nanmin(wls)
-		if startwave > 18600:
-			#one order
-			add=np.array([np.nan]*2048)
-			wls=np.insert(wls,0,add)
-			normed=np.insert(normed,0,add)
-			sns=np.insert(sns,0,add)
-			if startwave > 18800:
-				#two orders
-				wls=np.insert(wls,0,add)
-				normed=np.insert(normed,0,add)
-				sns=np.insert(sns,0,add)
-				if startwave > 19000:
-					#three orders
-					wls=np.insert(wls,0,add)
-					normed=np.insert(normed,0,add)
-					sns=np.insert(sns,0,add)
-		if len(wls) != keep:
-			diff=keep-len(wls)
-			add=np.array([np.nan]*diff)
-			wls=np.insert(wls,-1,add)
-			normed=np.insert(normed,-1,add)
-			sns=np.insert(sns,-1,add)
+	wlsol,spec,snr=fix_num_orders(wlsol,spec,snr)
 
-	### STEP B: Align the spectra
-	#now lets align the spectra to each other using some line
+	time=0
+	#step 4: start stepping through order by order.
+	for wl, I, sn in zip(wlsol, spec,snr):
+
+		#step 4.a. convert units
+		wl=wl*1.e4 #from 1.4 to 1.4e4 as expected (um to Ang)
+
+		#step 4.b. quality check
+		#lets chop the bad data a bit. Greg did a cut off of 8 to -6.
+		med=np.nanmean(I)
+		bad=scipy.where(-25.*med > I)
+		bad2=scipy.where(I > 25.*med)
 		
-	pix=np.arange(len(wls))	
-
-	### need to find any shift
-	#first one first - this is your reference spectrum now 
-	if num==0:
-		#set this one as your final wavelength solution and the reference to align
-		wavesol=wls
-
-		#find where this falls in the spectra		
-		reference_blueend=scipy.where(wls > aligning_region[0])
-		findblue=pix[reference_blueend]
-		reference_blueend_pix=np.min(findblue)
-		#print 'the blue end is', np.min(findblue), 'at wave',  reference_blueend_pix
-
-		reference_redend=scipy.where(wls < aligning_region[1])
-		findred=pix[reference_redend]
-		reference_redend_pix=np.max(findred)
-		#print 'the red end is', np.max(findred), reference_redend_pix
+		if med > 0.:
+			I[bad]=np.nan
+			sn[bad]=np.nan
+			I[bad2]=np.nan
+			sn[bad2]=np.nan		
 	
-		#lets set the reference pixel number
-		foundcenter=find_line_center(pix, normed, wls,[reference_blueend_pix,reference_redend_pix])
-		reference=foundcenter
-		shift=0.
+		#step 4.c. lets normalize the spectra (or find the value to later anyhow)
+		#lets find an average continuum value, as this will vary for each spectrum, and normalize
+		#have to find the correct order first, then we will just keep that value
+		if band == 'K':
+			if wl[0] < 21920:
+				if wl[0] > 21600:
+					#this should be the correct order for the continuum spot!
+					cont_start=scipy.where(wl > 21920)
+					cont_start=cont_start[0]
+					print 'order for estimating continuum:', wl[0]
+					cont_region=cont_start[0:800]
+					Icont=I[cont_region]
+	
+					#first cut off the top % for being crazy
+					top=np.nanpercentile(Icont, 95)
+					no_top=scipy.where(Icont < top)
+					Icont=Icont[no_top]
+					#now define the part to keep
+					keep=np.nanpercentile(Icont, 80)
+
+					where_keep=scipy.where(Icont > keep)
+					aIcont=Icont[where_keep]
+					Icont=np.nanmedian(aIcont)
+
+	
+					#plot to ensure that you are actually estimating the continuum
+					plotnow='no'
+					if plotnow == 'yes':
+						plt.plot(wl[cont_region], I[cont_region], color="red")
+						plt.plot(wl[cont_region][no_top][where_keep], aIcont, color="blue")
+						plt.axhline(y=Icont, color='black')
+						plt.axhline(y=np.nanmedian(I[cont_region]), color='green')
+						plt.title('Finding the continuum')
+						plt.show()
+						plt.close()
+
+		if band == 'H':
+			if wl[0] < 16000:#15500:
+				if wl[0] > 15800:#15400:
+					
+					#this should be the correct order for the continuum spot!
+					cont_start=scipy.where(wl > 15950)#15500)
+					cont_start=cont_start[0]
+					print 'order for estimating continuum:', wl[0]
+					cont_region=cont_start[0:800]#1000]
+					Icont=I[cont_region]
+	
+					#first cut off the top % for being crazy
+					top=np.nanpercentile(Icont, 95)
+					no_top=scipy.where(Icont < top)
+					Icont=Icont[no_top]
+					#now define the part to keep
+					keep=np.nanpercentile(Icont, 80)
+
+					where_keep=scipy.where(Icont > keep)
+					aIcont=Icont[where_keep]
+					Icont=np.nanmedian(aIcont)
+
+	
+					#plot to ensure that you are actually estimating the continuum
+					plotnow='no'
+					if plotnow == 'yes':
+						plt.plot(wl[cont_region], I[cont_region], color="red")
+						plt.plot(wl[cont_region][no_top][where_keep], aIcont, color="blue")
+						plt.axhline(y=Icont, color='black')
+						plt.axhline(y=np.nanmedian(I[cont_region]), color='green')
+						plt.title('Finding the continuum')
+						plt.show()
+						plt.close()
+
+		#step 4.d. Find the shift that you will need by measuring the center of a line		
+		#have to find the order where your line is
+		if band == 'K':
+			#assuming the first order you reach (as they go in descending wavelength)
+			#will work.
+			if wl[0] < aligning_region[0]:
+				if time == 0:
+					print 'Aligning in order: ', wl[0]
+					foundcenter=find_line_center(I, wl, aligning_region)
+					#now determine the shift
+					time = 1
+				
+		if band == 'H':
+			#need to use the shift found from before			
+			foundcenter=0.
 		
-		#print 'wavelength at start of the reference spectrum', wls[0], np.nanmin(wls)
-		
-	if num != 0:	
+		wls.append(wl)
+		Is.append(I)
+		sns.append(sn)
+	outdata=[wls, Is, sns, Icont, foundcenter, dataheader, target_id]	
+	return	outdata	
+				
 
-		pix=np.arange(len(wls))
+"""
+This is the body of the code.
+"""
 
-		blueend=scipy.where(wls > aligning_region[0])
-		findblue=pix[blueend]
-		blueend_pix_now=np.min(findblue)
-		#print 'the blue end is', np.min(findblue), blueend_pix_now, 'at wave', wls[blueend_pix_now]
-		#print 'compared to', reference_blueend_pix,  'at wave', wavesol[reference_blueend_pix]
-		extra=blueend_pix_now-reference_blueend_pix
-		#print 'the difference is', extra
-		#instead of doing this again for the red, find the offset difference "extra"
+### INPUT ###
+configfile=sys.argv[1]
+cfg=read_config(configfile)
+obsdir=cfg["obsdir"]
+obsdir_out=cfg["obsdir_out"]
+filein=obsdir+cfg["filein"]
+filename_out=cfg["filename_out"]	
+aligning_region=[np.float(cfg["linestart"]),np.float(cfg["linestop"])]
+if "lab_center" in cfg:
+	reference = 'lab'
+	lab_center=np.float(cfg["lab_center"])	
+else:
+	reference = "first"
 
-		#ok lets find the shift!
-		foundcenter=find_line_center(pix, normed, wls,[reference_blueend_pix+extra,reference_redend_pix+extra])
-		shift=foundcenter-reference+extra
-		print 'the pixel shift is', shift
+### BEGIN PROGRAM ###	
+#I also want to save a list of the input files that it actually uses. Yes we read them
+#in, its just a good cross check.
+#this will be one per spectra
+foundcenters=[]
+save_spec_files=[]
+ids=[]
+
+filename_out_txt=obsdir_out+filename_out+".txt" #text file out on info
+f=open(filename_out_txt, 'w')
+f.write('Combining spectra! \n')
+
+filename_out_tbl=obsdir_out+filename_out+".tbl" #short table
+f2=open(filename_out_tbl, 'w')
+f2.write('Combining spectra! \n')
+
+
+#step through all of the spectra
+specfiles=np.loadtxt(filein, skiprows=0, dtype="str")
+if specfiles.size == 1:
+	specfiles=[specfiles.tolist()]
+
+#INPUT ONLY K, and it will do H (if you like)
+bands=['K','H']
+
+for band in bands:
+	### STEP A: Get all the individual spectra ready to combine
+	print 'Combining band ', band
+	f.write('Combining band = '+band+'\n')	
+
+	#do it for one band first, all the spectra and then combine
+	#this is where we will start saving our data
+	#all of these will be order by order
+	saved_wavesol=[]
+	saved_fluxes_normed=[]
+	saved_snrs=[]
+
+	for i,specfile in enumerate(specfiles):
+		if band == 'K':
+			specfilename=specfile.split("DCH")
+			specfile=specfilename[0]+"DCK"+specfilename[1]
 			
-		##ok, so lets shift the spectra here. by the amount in pixels.
-		normed,sns=align_by_f_interp(shift, normed,sns, wls,cutoffs=[reference_blueend_pix+extra,reference_redend_pix+extra])
+		save_spec_files.append(specfile)
+		if i == 0:
+			if band == 'K':
+				f2.write('File \t Object \t UT Date \t Telescope \t Exp Time \t Airmass \t RV \t Standard \t Sequence \t c2d Name'+'\n')
 
-	#now we are saving the shifted spectra
-	#the wavelength solution is from your reference spectrum (the first in the list)
+		wl, I, sn, Icont, foundcenter, dataheader,id= band_spectra(obsdir, specfile, band, f,f2)
+		ids.append(id)
+		
+		#apply the normalizations!
+		normed=I/Icont
+		snrs=sn
+		
+		### am going to need to cycle through again?
+		if band == 'K':
+			foundcenters.append(foundcenter)
+			f.write('Measured line center'+np.str(foundcenter)+'\n')	
 
-	saved_fluxes_normed.append(normed)
-	saved_snrs.append(sns)
-
-	ids.append(sourcedets)
-	num=num+1
-
-### STEP C: Take the weighted mean
-
-#now lets find the mean! well, the weighted mean. so we need to do a lot with the uncs!
-#weight by the unc (well, 1/sigma^2). so lets assume that snr=1/unc. so weights are snr^2?
-saved_snrs=np.array(saved_snrs)
-w=(saved_snrs)**2
-###so I will be weighting by the uncertainties. 
-
-
-#giving 0 weights where there is a nan, wherever that may be!
-where_nan=np.isnan(w)
-where_nan=np.invert(np.isfinite(w))
-w[where_nan]=0.0
-saved_fluxes_normed=np.array(saved_fluxes_normed)
-where_nan=np.isnan(saved_fluxes_normed)
-saved_fluxes_normed[where_nan]=0.0
-w[where_nan]=0.0
-
-#the final maths to get the weighted average!
-averaged_flux=(np.sum(w*saved_fluxes_normed, axis=0))/(np.sum(w, axis=0))
-
-
-#then for determining the average uncertainty
-#see https://www.colorado.edu/physics/phys2150/phys2150_sp14/phys2150_lec4.pdf
-unc_ave=(np.sum(w, axis=0))**-0.5 ### note that this is the fractional uncertainty
-snr_ave=unc_ave**-1
-###also, probably want to save the real uncs, not the fractional unc
-unc_ave_units=unc_ave*averaged_flux
-
-#step D: save to a new fits file
-#the order is a bit like the plp, except with the uncs incorporating the a0v division
-
-#write the primary data, and fill out the header
-hdu=pyfits.PrimaryHDU()
-hdu.writeto(filename_out, clobber=True)
-#copy the target header
-header=dataheader
-header["EXTNAME"] = 'SPEC_COMBINED'
-header["N_SPECS"]=(len(saved_fluxes_normed),"Number of spec_div_a0v stars that have been combined")
-header.add_comment("This science spectrum was created by taking a weighted average")
-header.add_comment("Flux files: "+np.str(save_spec_files))
-pyfits.update(filename_out,averaged_flux, header)
-
-
-#add the rest of the extensions
-header["EXTNAME"]="WAVELENGTH"
-pyfits.append(filename_out,wavesol, header)
-header["EXTNAME"]="UNC_FLUX"
-pyfits.append(filename_out,unc_ave_units, header)
-header["EXTNAME"]="SNR"
-pyfits.append(filename_out,snr_ave, header)
-
-print '*** File out ***'
-print 'The combined spectra is being saved to ', filename_out
-
+		elif band == 'H':
+			foundcenter=foundcenters[i]
+			print 'Using the shift from K'
+			
+		### STEP B: Align and normalize the spectra
+		#no longer order by order, can do this to the entire thing
 	
-### STEP E: Lets plot!
+		#step 1.a. Apply any shifts to align the spectra
+		if reference == 'first':
+			#find the first spectrum
+			line_reference=foundcenters[0]
+		elif reference == 'lab':
+			line_reference = lab_center
+		
+		f.write('Finding rv shift from line at '+np.str(line_reference)+'\n')	
 
-plot='yes'
-if plot == 'yes':
-	fig = plt.figure()
+		if foundcenter != line_reference:
+			rv,wl=align(wl,foundcenter,line_reference,f)
+				
+		#step 1.b. Get the spectra on the same wavelength solution (from first spectra)
+		if i == 0:
+			wavesol=wl
+		else:
+			for i in range(len(wavesol)):
+				normed[i]=np.interp(wavesol[i],wl[i],normed[i])
+				snrs[i]=np.interp(wavesol[i],wl[i],snrs[i])
+		
+		#and we will call all of the fluxes normed now
+		saved_fluxes_normed.append(normed)
+		saved_snrs.append(snrs)
+		
+		#save some stuff to a table
+		if band == 'K':
+			f2.write(np.str(rv)+"\n")
+		
 
-	nums=np.arange(len(saved_fluxes_normed))
+		
+	#now work to combine all of the spectra in one band
+	### STEP C: Take the weighted mean
+	print 'Now taking the weighed average of ', len(saved_fluxes_normed)
+	f.write('***    \n')	
+	f.write('Now taking the weighed average of '+np.str(len(saved_fluxes_normed))+' spectra \n')	
 
-	#define some colors
-	#i prefer to have the colors repeat than a continous set
-	#for many spectra, the differences can be very subtle!
+	#now lets find the mean! well, the weighted mean. so we need to do a lot with the uncs!
+	#weight by the unc (well, 1/sigma^2). so lets assume that snr=1/unc. so weights are snr^2?
+	saved_snrs=np.array(saved_snrs)
+	w=(saved_snrs)**2
+	###so I will be weighting by the uncertainties. 
+
+
+	#giving 0 weights where there is a nan, wherever that may be! Yes, i know i did it to myself.
+	where_nan=np.isnan(w)
+	where_nan=np.invert(np.isfinite(w))
+	w[where_nan]=0.0
+	saved_fluxes_normed=np.array(saved_fluxes_normed)
+	where_nan=np.isnan(saved_fluxes_normed)
+	saved_fluxes_normed[where_nan]=0.0
+	w[where_nan]=0.0
 	
-	if len(specfiles) > 6:
-		colors=cm.rainbow(np.linspace(0,1,len(specfiles)/2))
-		colors=colors.tolist()
-		colors=colors*2 
-	else:	
-		colors=cm.rainbow(np.linspace(0,1,len(specfiles)))
-		colors=colors.tolist()
-	colors.append('magenta')
+	#the final maths to get the weighted average!
+	averaged_flux=(np.sum(w*saved_fluxes_normed, axis=0))/(np.sum(w, axis=0))
 
+	#then for determining the average uncertainty
+	#see https://www.colorado.edu/physics/phys2150/phys2150_sp14/phys2150_lec4.pdf
+	unc_ave=(np.sum(w, axis=0))**-0.5 ### note that this is the fractional uncertainty
+	snr_ave=unc_ave**-1
+	###also, probably want to save the real uncs, not the fractional unc
+	unc_ave_units=unc_ave*averaged_flux
+
+
+	#step D: save to a new fits file
+	#the order is a bit like the plp, except with the uncs incorporating the a0v division
+
+	sfilename_out=filename_out+'_'+band+'.fits'
+	f.write('*** File out *** \n')
+	f.write('The combined spectra is being saved to '+sfilename_out+'\n')
+
+	sfilename_out=obsdir_out+sfilename_out
+	#write the primary data, and fill out the header
+	hdu=pyfits.PrimaryHDU()
+	hdu.writeto(sfilename_out, clobber=True)
+	#copy the target header
+	header=dataheader
+	header["EXTNAME"] = 'SPEC_COMBINED'
+	header["N_SPECS"]=(len(saved_fluxes_normed),"Number of spec_div_a0v stars that have been combined")
+	header.add_comment("This science spectrum was created by taking a weighted average")
+	header.add_comment("Flux files: "+np.str(save_spec_files))
+	pyfits.update(sfilename_out,averaged_flux, header)
+
+
+	#add the rest of the extensions
+	header["EXTNAME"]="WAVELENGTH"
+	pyfits.append(sfilename_out,wavesol, header)
+	header["EXTNAME"]="UNC_FLUX"
+	pyfits.append(sfilename_out,unc_ave_units, header)
+	header["EXTNAME"]="SNR"
+	pyfits.append(sfilename_out,snr_ave, header)
+
+	print '*** File out ***'
+	print 'The combined spectra is being saved to ', sfilename_out
 	
-	for each_flux, snrs,id,linecolor in zip(saved_fluxes_normed,saved_snrs,ids,colors):
-		plt.plot(wavesol,each_flux,color=linecolor,linestyle = 'None', marker=".")
-	plt.errorbar(wavesol,averaged_flux,yerr=unc_ave_units, color='k')
+	### STEP E: Lets plot!
 
-	#now that you have gone through all of the spectra, show the plots
-	plt.xlabel('Wavelength $\AA$')			
-	plt.ylabel('Flux')
-	plt.title('Final Combined Spectrum')
-	plt.ylim([-10,10])
-	plt.xlim([19000,25000])
-	plt.show()	
-	plt.close()
+	plot='yes'
+	if plot == 'yes':
+		#overlay them on top of each other to check
+		fig, (ax1,ax2)=plt.subplots(2,sharex=False)
 
+
+		nums=np.arange(len(saved_fluxes_normed))
+
+		#define some colors
+		#i prefer to have the colors repeat than a continous set
+		#for many spectra, the differences can be very subtle!
+	
+		if len(specfiles) > 6:
+			colors=cm.rainbow(np.linspace(0,1,len(specfiles)/2))
+			colors=colors.tolist()
+			colors=colors*2 
+		else:	
+			colors=cm.rainbow(np.linspace(0,1,len(specfiles)))
+			colors=colors.tolist()
+		colors.append('magenta')
+
+		#plot 1: each spectra spaced apart and labeled (zoomed in a bit)
+		#plot 2: all on top of each other, with the average output in black 
+	
+		n=0
+		if band == 'H':
+			textspot=17000
+		else:
+			textspot=21700
+		for each_flux, snrs,id,linecolor in zip(saved_fluxes_normed,saved_snrs,ids,colors):
+			ax1.plot(wavesol,each_flux+0.15*n,color=linecolor,linestyle = 'None', marker=".")
+			ax1.text(textspot,1+0.15*n,id+" snr="+'%.2f' % np.nanmedian(snrs))
+			ax2.plot(wavesol,each_flux,color=linecolor,linestyle = 'None', marker=".")
+			n=n+1
+		for i in range(len(wavesol)):
+			#error bar won't work unless i go order by order
+			ax2.errorbar(wavesol[i],averaged_flux[i],yerr=unc_ave_units[i], color='k')
+		
+		#now that you have gone through all of the spectra, show the plots
+		plt.xlabel('Wavelength $\AA$')			
+		plt.ylabel('Flux')
+		ax1.set_title('Final Combined Spectrum')
+		ax1.set_ylim([0.7,1.1+0.15*len(saved_fluxes_normed)])
+		ax2.set_ylim([0,2.])
+		if band == 'K':
+			ax1.set_xlim([21000,22500])
+			ax2.set_xlim([19000,25000])
+		elif band == 'H':
+			ax1.set_xlim([16500,17500])
+			ax2.set_xlim([14500,18300])
+		
+		print 'The combined snr is', '%.2f' % np.nanmedian(snr_ave)
+		f.write('The combined snr is '+'%.2f' % np.nanmedian(snr_ave)+'\n')	
+		plt.show()	
+		plt.close()
+		
+	f.write('\n')	
+	f.write('\n')	
+	f.write('\n')	
+f.close()
+f2.close()
